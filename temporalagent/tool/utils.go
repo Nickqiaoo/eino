@@ -20,6 +20,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"strings"
 
 	"github.com/cloudwego/eino/schema"
 )
@@ -78,13 +80,90 @@ func (t *invokableTool[T, D]) InvokableRun(ctx context.Context, argumentsInJSON 
 	return string(result), nil
 }
 
-// goStruct2ParamsOneOf converts a go struct to ParamsOneOf
+// goStruct2ParamsOneOf converts a go struct to ParamsOneOf using reflection
 func goStruct2ParamsOneOf[T any]() (*schema.ParamsOneOf, error) {
-	// Create params from struct fields
-	// In production, use reflection to properly extract field info
+	var t T
+	typ := reflect.TypeOf(t)
+
+	// Handle pointer types
+	if typ.Kind() == reflect.Ptr {
+		typ = typ.Elem()
+	}
+
+	if typ.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("expected struct type, got %s", typ.Kind())
+	}
+
 	params := make(map[string]*schema.ParameterInfo)
 
-	// For now, return empty params - in production should use reflection
-	// to extract field names and types from the struct
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+
+		// Skip unexported fields
+		if !field.IsExported() {
+			continue
+		}
+
+		// Get JSON tag name
+		jsonTag := field.Tag.Get("json")
+		fieldName := field.Name
+		if jsonTag != "" {
+			parts := strings.Split(jsonTag, ",")
+			if parts[0] != "" && parts[0] != "-" {
+				fieldName = parts[0]
+			}
+		}
+
+		// Get description from jsonschema tag
+		desc := field.Tag.Get("jsonschema")
+		if desc != "" {
+			// Parse "description=xxx" format
+			for _, part := range strings.Split(desc, ",") {
+				if strings.HasPrefix(part, "description=") {
+					desc = strings.TrimPrefix(part, "description=")
+					break
+				}
+			}
+		}
+
+		// Convert Go type to schema type
+		paramType := goTypeToSchemaType(field.Type)
+
+		// Check if required (simple heuristic: non-pointer types are required)
+		required := field.Type.Kind() != reflect.Ptr
+
+		params[fieldName] = &schema.ParameterInfo{
+			Type:     paramType,
+			Desc:     desc,
+			Required: required,
+		}
+	}
+
 	return schema.NewParamsOneOfByParams(params), nil
+}
+
+// goTypeToSchemaType converts a Go reflect.Type to schema.DataType
+func goTypeToSchemaType(t reflect.Type) schema.DataType {
+	// Handle pointer types
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+
+	switch t.Kind() {
+	case reflect.String:
+		return schema.String
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return schema.Integer
+	case reflect.Float32, reflect.Float64:
+		return schema.Number
+	case reflect.Bool:
+		return schema.Boolean
+	case reflect.Slice, reflect.Array:
+		return schema.Array
+	case reflect.Map, reflect.Struct:
+		return schema.Object
+	default:
+		return schema.String
+	}
 }

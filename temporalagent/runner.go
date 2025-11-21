@@ -18,12 +18,17 @@ package temporalagent
 
 import (
 	"context"
+	"time"
 )
 
 // RunnerConfig is the configuration for Runner
 type RunnerConfig struct {
 	TemporalHost string // default: localhost:7233
 	TaskQueue    string // default: agent-tasks
+
+	// Timeout options
+	LLMTimeout  time.Duration // default: 2 minutes
+	ToolTimeout time.Duration // default: 5 minutes
 }
 
 // Runner manages agent execution
@@ -41,6 +46,8 @@ func NewRunner(ctx context.Context, agent Agent, config *RunnerConfig) (*Runner,
 	executor, err := NewTemporalExecutor(&ExecutorConfig{
 		TemporalHost: config.TemporalHost,
 		TaskQueue:    config.TaskQueue,
+		LLMTimeout:   config.LLMTimeout,
+		ToolTimeout:  config.ToolTimeout,
 	})
 	if err != nil {
 		return nil, err

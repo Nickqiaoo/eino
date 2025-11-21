@@ -35,13 +35,20 @@ import (
 type ExecutorConfig struct {
 	TemporalHost string
 	TaskQueue    string
+
+	// Activity options
+	LLMTimeout  time.Duration // default: 2 minutes
+	ToolTimeout time.Duration // default: 5 minutes
 }
 
 // TemporalExecutor manages temporal workflow/activity registration and execution
 type TemporalExecutor struct {
-	client    client.Client
-	worker    worker.Worker
-	taskQueue string
+	client        client.Client
+	worker        worker.Worker
+	taskQueue     string
+	modelRegistry *ModelRegistry
+	llmTimeout    time.Duration
+	toolTimeout   time.Duration
 }
 
 // NewTemporalExecutor creates a new temporal executor
@@ -65,11 +72,29 @@ func NewTemporalExecutor(config *ExecutorConfig) (*TemporalExecutor, error) {
 
 	w := worker.New(c, taskQueue, worker.Options{})
 
-	return &TemporalExecutor{
-		client:    c,
-		worker:    w,
-		taskQueue: taskQueue,
-	}, nil
+	llmTimeout := config.LLMTimeout
+	if llmTimeout == 0 {
+		llmTimeout = 2 * time.Minute
+	}
+
+	toolTimeout := config.ToolTimeout
+	if toolTimeout == 0 {
+		toolTimeout = 5 * time.Minute
+	}
+
+	executor := &TemporalExecutor{
+		client:        c,
+		worker:        w,
+		taskQueue:     taskQueue,
+		modelRegistry: NewModelRegistry(),
+		llmTimeout:    llmTimeout,
+		toolTimeout:   toolTimeout,
+	}
+
+	// Register LLM activity
+	w.RegisterActivity(LLMActivity)
+
+	return executor, nil
 }
 
 // RegisterAgentTree recursively registers an agent and all its sub-agents and tools
@@ -159,7 +184,30 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 			return completed, nil
 		})
 
+		// Resume signal channel
+		resumeCh := workflow.GetSignalChannel(ctx, "resume")
+
 		messages := params.Messages
+
+		// Helper function to wait for resume
+		waitForResume := func(interruptInfo any) *schema.Message {
+			checkpointID := workflow.GetInfo(ctx).WorkflowExecution.ID
+			events = append(events, &AgentEvent{
+				Type: "interrupted",
+				Action: &AgentAction{Interrupted: true},
+				InterruptInfo: &InterruptInfo{
+					CheckpointID: checkpointID,
+					Info:         interruptInfo,
+				},
+			})
+
+			var resumeInput ResumeInput
+			resumeCh.Receive(ctx, &resumeInput)
+			return resumeInput.Message
+		}
+
+		// Check for pending resume at start
+		_ = waitForResume
 
 		for i := 0; i < config.MaxIter; i++ {
 			// Emit llm_start event
@@ -214,7 +262,34 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 
 				var result string
 
-				if subAgent, ok := agentTools[tc.Name]; ok {
+				// Handle built-in tools
+				if IsHumanInputTool(tc.Name) {
+					// Human input tool -> Interrupt and wait for resume
+					var req struct {
+						Question string `json:"question"`
+					}
+					json.Unmarshal([]byte(tc.Arguments), &req)
+
+					// Wait for human input
+					resumeMsg := waitForResume(req.Question)
+					if resumeMsg != nil {
+						result = resumeMsg.Content
+					}
+				} else if IsExitTool(tc.Name) {
+					// Exit tool -> Return immediately
+					var req struct {
+						Result string `json:"result"`
+					}
+					json.Unmarshal([]byte(tc.Arguments), &req)
+
+					events = append(events, &AgentEvent{Type: "completed"})
+					completed = true
+					return &WorkflowResult{
+						Output: req.Result,
+						Action: &AgentAction{Exit: true},
+						Events: events,
+					}, nil
+				} else if subAgent, ok := agentTools[tc.Name]; ok {
 					// AgentTool -> Child Workflow
 					childOpts := workflow.ChildWorkflowOptions{
 						WorkflowID: workflow.GetInfo(ctx).WorkflowExecution.ID + "/" + tc.Name,
