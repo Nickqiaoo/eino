@@ -93,7 +93,6 @@ func NewTemporalExecutor(config *ExecutorConfig) (*TemporalExecutor, error) {
 
 	// Register activities
 	w.RegisterActivity(LLMActivity)
-	w.RegisterActivity(SendEventActivity)
 
 	return executor, nil
 }
@@ -176,14 +175,12 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
 		}
 
-		// Helper to send events via LocalActivity
-		localOpts := workflow.LocalActivityOptions{
-			StartToCloseTimeout: time.Second,
-		}
-		localCtx := workflow.WithLocalActivityOptions(ctx, localOpts)
-
+		// Helper to send events via SideEffect (won't re-execute on replay)
 		sendEvent := func(event *AgentEvent) {
-			workflow.ExecuteLocalActivity(localCtx, SendEventActivity, rootWorkflowID, event).Get(ctx, nil)
+			workflow.SideEffect(ctx, func(ctx workflow.Context) interface{} {
+				GetEventBus().Send(rootWorkflowID, event)
+				return nil
+			})
 		}
 
 		// Resume signal channel
@@ -370,14 +367,12 @@ func (e *TemporalExecutor) buildSequentialWorkflow(subAgents []Agent) interface{
 			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
 		}
 
-		// Helper to send events via LocalActivity
-		localOpts := workflow.LocalActivityOptions{
-			StartToCloseTimeout: time.Second,
-		}
-		localCtx := workflow.WithLocalActivityOptions(ctx, localOpts)
-
+		// Helper to send events via SideEffect (won't re-execute on replay)
 		sendEvent := func(event *AgentEvent) {
-			workflow.ExecuteLocalActivity(localCtx, SendEventActivity, rootWorkflowID, event).Get(ctx, nil)
+			workflow.SideEffect(ctx, func(ctx workflow.Context) interface{} {
+				GetEventBus().Send(rootWorkflowID, event)
+				return nil
+			})
 		}
 
 		messages := params.Messages
@@ -434,14 +429,12 @@ func (e *TemporalExecutor) buildParallelWorkflow(subAgents []Agent) interface{} 
 			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
 		}
 
-		// Helper to send events via LocalActivity
-		localOpts := workflow.LocalActivityOptions{
-			StartToCloseTimeout: time.Second,
-		}
-		localCtx := workflow.WithLocalActivityOptions(ctx, localOpts)
-
+		// Helper to send events via SideEffect (won't re-execute on replay)
 		sendEvent := func(event *AgentEvent) {
-			workflow.ExecuteLocalActivity(localCtx, SendEventActivity, rootWorkflowID, event).Get(ctx, nil)
+			workflow.SideEffect(ctx, func(ctx workflow.Context) interface{} {
+				GetEventBus().Send(rootWorkflowID, event)
+				return nil
+			})
 		}
 
 		// Start all child workflows in parallel
@@ -487,14 +480,12 @@ func (e *TemporalExecutor) buildLoopWorkflow(subAgents []Agent, maxIteration int
 			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
 		}
 
-		// Helper to send events via LocalActivity
-		localOpts := workflow.LocalActivityOptions{
-			StartToCloseTimeout: time.Second,
-		}
-		localCtx := workflow.WithLocalActivityOptions(ctx, localOpts)
-
+		// Helper to send events via SideEffect (won't re-execute on replay)
 		sendEvent := func(event *AgentEvent) {
-			workflow.ExecuteLocalActivity(localCtx, SendEventActivity, rootWorkflowID, event).Get(ctx, nil)
+			workflow.SideEffect(ctx, func(ctx workflow.Context) interface{} {
+				GetEventBus().Send(rootWorkflowID, event)
+				return nil
+			})
 		}
 
 		messages := params.Messages
