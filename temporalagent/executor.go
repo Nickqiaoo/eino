@@ -175,8 +175,12 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
 		}
 
+		// Events array for persistence
+		var events []*AgentEvent
+
 		// Helper to send events via SideEffect (won't re-execute on replay)
 		sendEvent := func(event *AgentEvent) {
+			events = append(events, event)
 			workflow.SideEffect(ctx, func(ctx workflow.Context) interface{} {
 				GetEventBus().Send(rootWorkflowID, event)
 				return nil
@@ -227,9 +231,9 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 				Instruction: config.Instruction,
 			}).Get(ctx, &resp)
 
-			if err != nil {
+				if err != nil {
 				sendEvent(&AgentEvent{Type: "error", Err: err})
-				return nil, err
+				return &WorkflowResult{Events: events}, err
 			}
 
 				// Emit llm_response event
@@ -243,7 +247,8 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 			if len(resp.ToolCalls) == 0 {
 				sendEvent(&AgentEvent{Type: "completed"})
 				return &WorkflowResult{
-					Output: resp.Content,
+					Output:  resp.Content,
+					Events: events,
 				}, nil
 			}
 
@@ -280,8 +285,9 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 
 					sendEvent(&AgentEvent{Type: "completed"})
 					return &WorkflowResult{
-						Output: req.Result,
+						Output:  req.Result,
 						Action: &AgentAction{Exit: true},
+						Events: events,
 					}, nil
 				} else if subAgent, ok := agentTools[tc.Name]; ok {
 					// AgentTool -> Child Workflow
@@ -301,6 +307,8 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 					if err != nil {
 						result = fmt.Sprintf("error: %v", err)
 					} else {
+						// Merge child events
+						events = append(events, wfResult.Events...)
 						result = wfResult.Output
 					}
 				} else if tc.Name == "transferToAgent" {
@@ -324,13 +332,16 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 					).Get(ctx, &wfResult)
 
 					if err != nil {
-						return nil, err
+						return &WorkflowResult{Events: events}, err
 					}
 
+					// Merge child events
+					events = append(events, wfResult.Events...)
 					sendEvent(&AgentEvent{Type: "completed"})
 					return &WorkflowResult{
-						Output: wfResult.Output,
+						Output:  wfResult.Output,
 						Action: wfResult.Action,
+						Events: events,
 					}, nil
 				} else {
 					// Normal tool -> Activity
@@ -354,7 +365,7 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 		}
 
 		sendEvent(&AgentEvent{Type: "completed"})
-		return &WorkflowResult{}, nil
+		return &WorkflowResult{Events: events}, nil
 	}
 }
 
@@ -367,8 +378,12 @@ func (e *TemporalExecutor) buildSequentialWorkflow(subAgents []Agent) interface{
 			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
 		}
 
+		// Events array for persistence
+		var events []*AgentEvent
+
 		// Helper to send events via SideEffect (won't re-execute on replay)
 		sendEvent := func(event *AgentEvent) {
+			events = append(events, event)
 			workflow.SideEffect(ctx, func(ctx workflow.Context) interface{} {
 				GetEventBus().Send(rootWorkflowID, event)
 				return nil
@@ -394,11 +409,15 @@ func (e *TemporalExecutor) buildSequentialWorkflow(subAgents []Agent) interface{
 			).Get(ctx, &result)
 
 			if err != nil {
-				return nil, err
+				return &WorkflowResult{Events: events}, err
 			}
+
+			// Merge child events
+			events = append(events, result.Events...)
 
 			// Check for interrupt
 			if result.Action != nil && result.Action.Interrupted {
+				result.Events = events
 				return &result, nil
 			}
 
@@ -409,13 +428,15 @@ func (e *TemporalExecutor) buildSequentialWorkflow(subAgents []Agent) interface{
 
 			// Check for exit
 			if result.Action != nil && result.Action.Exit {
+				result.Events = events
 				return &result, nil
 			}
 		}
 
 		sendEvent(&AgentEvent{Type: "completed"})
 		return &WorkflowResult{
-			Output: getLastOutput(messages),
+			Output:  getLastOutput(messages),
+			Events: events,
 		}, nil
 	}
 }
@@ -429,8 +450,12 @@ func (e *TemporalExecutor) buildParallelWorkflow(subAgents []Agent) interface{} 
 			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
 		}
 
+		// Events array for persistence
+		var events []*AgentEvent
+
 		// Helper to send events via SideEffect (won't re-execute on replay)
 		sendEvent := func(event *AgentEvent) {
+			events = append(events, event)
 			workflow.SideEffect(ctx, func(ctx workflow.Context) interface{} {
 				GetEventBus().Send(rootWorkflowID, event)
 				return nil
@@ -459,14 +484,17 @@ func (e *TemporalExecutor) buildParallelWorkflow(subAgents []Agent) interface{} 
 		for _, f := range futures {
 			var result WorkflowResult
 			if err := f.Get(ctx, &result); err != nil {
-				return nil, err
+				return &WorkflowResult{Events: events}, err
 			}
 			results = append(results, &result)
+			// Merge child events
+			events = append(events, result.Events...)
 		}
 
 		sendEvent(&AgentEvent{Type: "completed"})
 		return &WorkflowResult{
-			Output: mergeOutputs(results),
+			Output:  mergeOutputs(results),
+			Events: events,
 		}, nil
 	}
 }
@@ -480,8 +508,12 @@ func (e *TemporalExecutor) buildLoopWorkflow(subAgents []Agent, maxIteration int
 			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
 		}
 
+		// Events array for persistence
+		var events []*AgentEvent
+
 		// Helper to send events via SideEffect (won't re-execute on replay)
 		sendEvent := func(event *AgentEvent) {
+			events = append(events, event)
 			workflow.SideEffect(ctx, func(ctx workflow.Context) interface{} {
 				GetEventBus().Send(rootWorkflowID, event)
 				return nil
@@ -508,8 +540,11 @@ func (e *TemporalExecutor) buildLoopWorkflow(subAgents []Agent, maxIteration int
 				).Get(ctx, &result)
 
 				if err != nil {
-					return nil, err
+					return &WorkflowResult{Events: events}, err
 				}
+
+				// Merge child events
+				events = append(events, result.Events...)
 
 				if result.Output != "" {
 					messages = append(messages, schema.AssistantMessage(result.Output, nil))
@@ -518,6 +553,7 @@ func (e *TemporalExecutor) buildLoopWorkflow(subAgents []Agent, maxIteration int
 				// Check for break loop
 				if result.Action != nil && result.Action.BreakLoop {
 					sendEvent(&AgentEvent{Type: "completed"})
+					result.Events = events
 					return &result, nil
 				}
 			}
@@ -525,7 +561,8 @@ func (e *TemporalExecutor) buildLoopWorkflow(subAgents []Agent, maxIteration int
 
 		sendEvent(&AgentEvent{Type: "completed"})
 		return &WorkflowResult{
-			Output: getLastOutput(messages),
+			Output:  getLastOutput(messages),
+			Events: events,
 		}, nil
 	}
 }
