@@ -72,8 +72,9 @@ type ResumeInput struct {
 
 // WorkflowParams is the params for temporal workflow
 type WorkflowParams struct {
-	Messages []*schema.Message
-	RunPath  []string
+	Messages       []*schema.Message
+	RunPath        []string
+	RootWorkflowID string // for event routing
 }
 
 // WorkflowResult is the result from temporal workflow

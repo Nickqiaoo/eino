@@ -91,8 +91,9 @@ func NewTemporalExecutor(config *ExecutorConfig) (*TemporalExecutor, error) {
 		toolTimeout:   toolTimeout,
 	}
 
-	// Register LLM activity
+	// Register activities
 	w.RegisterActivity(LLMActivity)
+	w.RegisterActivity(SendEventActivity)
 
 	return executor, nil
 }
@@ -169,20 +170,21 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 	}
 
 	return func(ctx workflow.Context, params WorkflowParams) (*WorkflowResult, error) {
-		var events []*AgentEvent
-		completed := false
+		// Determine root workflow ID for event routing
+		rootWorkflowID := params.RootWorkflowID
+		if rootWorkflowID == "" {
+			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
+		}
 
-		// Register query handlers
-		workflow.SetQueryHandler(ctx, "getEvents", func(fromIndex int) ([]*AgentEvent, error) {
-			if fromIndex >= len(events) {
-				return nil, nil
-			}
-			return events[fromIndex:], nil
-		})
+		// Helper to send events via LocalActivity
+		localOpts := workflow.LocalActivityOptions{
+			StartToCloseTimeout: time.Second,
+		}
+		localCtx := workflow.WithLocalActivityOptions(ctx, localOpts)
 
-		workflow.SetQueryHandler(ctx, "isCompleted", func() (bool, error) {
-			return completed, nil
-		})
+		sendEvent := func(event *AgentEvent) {
+			workflow.ExecuteLocalActivity(localCtx, SendEventActivity, rootWorkflowID, event).Get(ctx, nil)
+		}
 
 		// Resume signal channel
 		resumeCh := workflow.GetSignalChannel(ctx, "resume")
@@ -192,7 +194,7 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 		// Helper function to wait for resume
 		waitForResume := func(interruptInfo any) *schema.Message {
 			checkpointID := workflow.GetInfo(ctx).WorkflowExecution.ID
-			events = append(events, &AgentEvent{
+			sendEvent(&AgentEvent{
 				Type: "interrupted",
 				Action: &AgentAction{Interrupted: true},
 				InterruptInfo: &InterruptInfo{
@@ -211,7 +213,7 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 
 		for i := 0; i < config.MaxIter; i++ {
 			// Emit llm_start event
-			events = append(events, &AgentEvent{
+			sendEvent(&AgentEvent{
 				AgentName: config.Name,
 				Type:      "llm_start",
 			})
@@ -229,13 +231,12 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 			}).Get(ctx, &resp)
 
 			if err != nil {
-				events = append(events, &AgentEvent{Type: "error", Err: err})
-				completed = true
+				sendEvent(&AgentEvent{Type: "error", Err: err})
 				return nil, err
 			}
 
-			// Emit llm_response event
-			events = append(events, &AgentEvent{
+				// Emit llm_response event
+			sendEvent(&AgentEvent{
 				AgentName: config.Name,
 				Type:      "llm_response",
 				Output:    &AgentOutput{Message: schema.AssistantMessage(resp.Content, nil)},
@@ -243,18 +244,16 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 
 			// No tool calls - return result
 			if len(resp.ToolCalls) == 0 {
-				events = append(events, &AgentEvent{Type: "completed"})
-				completed = true
+				sendEvent(&AgentEvent{Type: "completed"})
 				return &WorkflowResult{
 					Output: resp.Content,
-					Events: events,
 				}, nil
 			}
 
 			// Process tool calls
 			for _, tc := range resp.ToolCalls {
 				// Emit tool_start event
-				events = append(events, &AgentEvent{
+				sendEvent(&AgentEvent{
 					AgentName: config.Name,
 					Type:      "tool_start",
 					ToolCall:  &tc,
@@ -282,12 +281,10 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 					}
 					json.Unmarshal([]byte(tc.Arguments), &req)
 
-					events = append(events, &AgentEvent{Type: "completed"})
-					completed = true
+					sendEvent(&AgentEvent{Type: "completed"})
 					return &WorkflowResult{
 						Output: req.Result,
 						Action: &AgentAction{Exit: true},
-						Events: events,
 					}, nil
 				} else if subAgent, ok := agentTools[tc.Name]; ok {
 					// AgentTool -> Child Workflow
@@ -298,14 +295,15 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 
 					var wfResult WorkflowResult
 					err := workflow.ExecuteChildWorkflow(childCtx, subAgent.Name(context.Background()),
-						WorkflowParams{Messages: parseToolArgsToMessages(tc.Arguments)},
+						WorkflowParams{
+							Messages:       parseToolArgsToMessages(tc.Arguments),
+							RootWorkflowID: rootWorkflowID,
+						},
 					).Get(ctx, &wfResult)
 
 					if err != nil {
 						result = fmt.Sprintf("error: %v", err)
 					} else {
-						// Merge child events into parent
-						events = append(events, wfResult.Events...)
 						result = wfResult.Output
 					}
 				} else if tc.Name == "transferToAgent" {
@@ -322,21 +320,20 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 
 					var wfResult WorkflowResult
 					err := workflow.ExecuteChildWorkflow(childCtx, req.AgentName,
-						WorkflowParams{Messages: messages},
+						WorkflowParams{
+							Messages:       messages,
+							RootWorkflowID: rootWorkflowID,
+						},
 					).Get(ctx, &wfResult)
 
 					if err != nil {
 						return nil, err
 					}
 
-					// Merge child events before returning
-					events = append(events, wfResult.Events...)
-					events = append(events, &AgentEvent{Type: "completed"})
-					completed = true
+					sendEvent(&AgentEvent{Type: "completed"})
 					return &WorkflowResult{
 						Output: wfResult.Output,
 						Action: wfResult.Action,
-						Events: events,
 					}, nil
 				} else {
 					// Normal tool -> Activity
@@ -347,7 +344,7 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 				}
 
 				// Emit tool_result event
-				events = append(events, &AgentEvent{
+				sendEvent(&AgentEvent{
 					AgentName:  config.Name,
 					Type:       "tool_result",
 					ToolCall:   &tc,
@@ -359,28 +356,29 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 			}
 		}
 
-		events = append(events, &AgentEvent{Type: "completed"})
-		completed = true
-		return &WorkflowResult{Events: events}, nil
+		sendEvent(&AgentEvent{Type: "completed"})
+		return &WorkflowResult{}, nil
 	}
 }
 
 // buildSequentialWorkflow builds a workflow function for SequentialAgent
 func (e *TemporalExecutor) buildSequentialWorkflow(subAgents []Agent) interface{} {
 	return func(ctx workflow.Context, params WorkflowParams) (*WorkflowResult, error) {
-		var events []*AgentEvent
-		completed := false
+		// Determine root workflow ID for event routing
+		rootWorkflowID := params.RootWorkflowID
+		if rootWorkflowID == "" {
+			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
+		}
 
-		workflow.SetQueryHandler(ctx, "getEvents", func(fromIndex int) ([]*AgentEvent, error) {
-			if fromIndex >= len(events) {
-				return nil, nil
-			}
-			return events[fromIndex:], nil
-		})
+		// Helper to send events via LocalActivity
+		localOpts := workflow.LocalActivityOptions{
+			StartToCloseTimeout: time.Second,
+		}
+		localCtx := workflow.WithLocalActivityOptions(ctx, localOpts)
 
-		workflow.SetQueryHandler(ctx, "isCompleted", func() (bool, error) {
-			return completed, nil
-		})
+		sendEvent := func(event *AgentEvent) {
+			workflow.ExecuteLocalActivity(localCtx, SendEventActivity, rootWorkflowID, event).Get(ctx, nil)
+		}
 
 		messages := params.Messages
 
@@ -394,15 +392,15 @@ func (e *TemporalExecutor) buildSequentialWorkflow(subAgents []Agent) interface{
 
 			var result WorkflowResult
 			err := workflow.ExecuteChildWorkflow(childCtx, subName,
-				WorkflowParams{Messages: messages},
+				WorkflowParams{
+					Messages:       messages,
+					RootWorkflowID: rootWorkflowID,
+				},
 			).Get(ctx, &result)
 
 			if err != nil {
 				return nil, err
 			}
-
-			// Collect events from child
-			events = append(events, result.Events...)
 
 			// Check for interrupt
 			if result.Action != nil && result.Action.Interrupted {
@@ -416,16 +414,13 @@ func (e *TemporalExecutor) buildSequentialWorkflow(subAgents []Agent) interface{
 
 			// Check for exit
 			if result.Action != nil && result.Action.Exit {
-				completed = true
 				return &result, nil
 			}
 		}
 
-		events = append(events, &AgentEvent{Type: "completed"})
-		completed = true
+		sendEvent(&AgentEvent{Type: "completed"})
 		return &WorkflowResult{
 			Output: getLastOutput(messages),
-			Events: events,
 		}, nil
 	}
 }
@@ -433,19 +428,21 @@ func (e *TemporalExecutor) buildSequentialWorkflow(subAgents []Agent) interface{
 // buildParallelWorkflow builds a workflow function for ParallelAgent
 func (e *TemporalExecutor) buildParallelWorkflow(subAgents []Agent) interface{} {
 	return func(ctx workflow.Context, params WorkflowParams) (*WorkflowResult, error) {
-		var events []*AgentEvent
-		completed := false
+		// Determine root workflow ID for event routing
+		rootWorkflowID := params.RootWorkflowID
+		if rootWorkflowID == "" {
+			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
+		}
 
-		workflow.SetQueryHandler(ctx, "getEvents", func(fromIndex int) ([]*AgentEvent, error) {
-			if fromIndex >= len(events) {
-				return nil, nil
-			}
-			return events[fromIndex:], nil
-		})
+		// Helper to send events via LocalActivity
+		localOpts := workflow.LocalActivityOptions{
+			StartToCloseTimeout: time.Second,
+		}
+		localCtx := workflow.WithLocalActivityOptions(ctx, localOpts)
 
-		workflow.SetQueryHandler(ctx, "isCompleted", func() (bool, error) {
-			return completed, nil
-		})
+		sendEvent := func(event *AgentEvent) {
+			workflow.ExecuteLocalActivity(localCtx, SendEventActivity, rootWorkflowID, event).Get(ctx, nil)
+		}
 
 		// Start all child workflows in parallel
 		var futures []workflow.ChildWorkflowFuture
@@ -457,7 +454,10 @@ func (e *TemporalExecutor) buildParallelWorkflow(subAgents []Agent) interface{} 
 			}
 			childCtx := workflow.WithChildOptions(ctx, childOpts)
 
-			f := workflow.ExecuteChildWorkflow(childCtx, subName, params)
+			f := workflow.ExecuteChildWorkflow(childCtx, subName, WorkflowParams{
+				Messages:       params.Messages,
+				RootWorkflowID: rootWorkflowID,
+			})
 			futures = append(futures, f)
 		}
 
@@ -469,14 +469,11 @@ func (e *TemporalExecutor) buildParallelWorkflow(subAgents []Agent) interface{} 
 				return nil, err
 			}
 			results = append(results, &result)
-			events = append(events, result.Events...)
 		}
 
-		events = append(events, &AgentEvent{Type: "completed"})
-		completed = true
+		sendEvent(&AgentEvent{Type: "completed"})
 		return &WorkflowResult{
 			Output: mergeOutputs(results),
-			Events: events,
 		}, nil
 	}
 }
@@ -484,19 +481,21 @@ func (e *TemporalExecutor) buildParallelWorkflow(subAgents []Agent) interface{} 
 // buildLoopWorkflow builds a workflow function for LoopAgent
 func (e *TemporalExecutor) buildLoopWorkflow(subAgents []Agent, maxIteration int) interface{} {
 	return func(ctx workflow.Context, params WorkflowParams) (*WorkflowResult, error) {
-		var events []*AgentEvent
-		completed := false
+		// Determine root workflow ID for event routing
+		rootWorkflowID := params.RootWorkflowID
+		if rootWorkflowID == "" {
+			rootWorkflowID = workflow.GetInfo(ctx).WorkflowExecution.ID
+		}
 
-		workflow.SetQueryHandler(ctx, "getEvents", func(fromIndex int) ([]*AgentEvent, error) {
-			if fromIndex >= len(events) {
-				return nil, nil
-			}
-			return events[fromIndex:], nil
-		})
+		// Helper to send events via LocalActivity
+		localOpts := workflow.LocalActivityOptions{
+			StartToCloseTimeout: time.Second,
+		}
+		localCtx := workflow.WithLocalActivityOptions(ctx, localOpts)
 
-		workflow.SetQueryHandler(ctx, "isCompleted", func() (bool, error) {
-			return completed, nil
-		})
+		sendEvent := func(event *AgentEvent) {
+			workflow.ExecuteLocalActivity(localCtx, SendEventActivity, rootWorkflowID, event).Get(ctx, nil)
+		}
 
 		messages := params.Messages
 
@@ -511,14 +510,15 @@ func (e *TemporalExecutor) buildLoopWorkflow(subAgents []Agent, maxIteration int
 
 				var result WorkflowResult
 				err := workflow.ExecuteChildWorkflow(childCtx, subName,
-					WorkflowParams{Messages: messages},
+					WorkflowParams{
+						Messages:       messages,
+						RootWorkflowID: rootWorkflowID,
+					},
 				).Get(ctx, &result)
 
 				if err != nil {
 					return nil, err
 				}
-
-				events = append(events, result.Events...)
 
 				if result.Output != "" {
 					messages = append(messages, schema.AssistantMessage(result.Output, nil))
@@ -526,18 +526,15 @@ func (e *TemporalExecutor) buildLoopWorkflow(subAgents []Agent, maxIteration int
 
 				// Check for break loop
 				if result.Action != nil && result.Action.BreakLoop {
-					events = append(events, &AgentEvent{Type: "completed"})
-					completed = true
+					sendEvent(&AgentEvent{Type: "completed"})
 					return &result, nil
 				}
 			}
 		}
 
-		events = append(events, &AgentEvent{Type: "completed"})
-		completed = true
+		sendEvent(&AgentEvent{Type: "completed"})
 		return &WorkflowResult{
 			Output: getLastOutput(messages),
-			Events: events,
 		}, nil
 	}
 }
@@ -558,64 +555,36 @@ func (e *TemporalExecutor) StartWorkflow(ctx context.Context, agentName string, 
 	return workflowID, nil
 }
 
-// SubscribeEvents polls for events from a running workflow
+// SubscribeEvents subscribes to events from a running workflow via EventBus
 func (e *TemporalExecutor) SubscribeEvents(ctx context.Context, workflowID string) <-chan *AgentEvent {
-	ch := make(chan *AgentEvent, 100)
+	// Register with EventBus
+	eventBus := GetEventBus()
+	eventCh := eventBus.Register(workflowID)
+
+	// Create output channel
+	outputCh := make(chan *AgentEvent, 100)
 
 	go func() {
-		defer close(ch)
-
-		eventIndex := 0
-		pollInterval := 100 * time.Millisecond
+		defer close(outputCh)
+		defer eventBus.Unregister(workflowID)
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			default:
-			}
-
-			// Query for new events
-			resp, err := e.client.QueryWorkflow(ctx, workflowID, "", "getEvents", eventIndex)
-			if err != nil {
-				// Workflow may have completed, try to get final result
-				run := e.client.GetWorkflow(ctx, workflowID, "")
-				var result WorkflowResult
-				if err := run.Get(ctx, &result); err == nil {
-					// Send remaining events
-					for i := eventIndex; i < len(result.Events); i++ {
-						ch <- result.Events[i]
-					}
+			case event, ok := <-eventCh:
+				if !ok {
+					return
 				}
-				return
-			}
-
-			var events []*AgentEvent
-			if err := resp.Get(&events); err == nil && len(events) > 0 {
-				for _, event := range events {
-					ch <- event
-					eventIndex++
-
-					if event.Type == "completed" || event.Type == "error" {
-						return
-					}
-				}
-			}
-
-			// Check if completed
-			completedResp, err := e.client.QueryWorkflow(ctx, workflowID, "", "isCompleted")
-			if err == nil {
-				var done bool
-				if completedResp.Get(&done) == nil && done {
+				outputCh <- event
+				if event.Type == "completed" || event.Type == "error" {
 					return
 				}
 			}
-
-			time.Sleep(pollInterval)
 		}
 	}()
 
-	return ch
+	return outputCh
 }
 
 // Resume sends a resume signal to an interrupted workflow
