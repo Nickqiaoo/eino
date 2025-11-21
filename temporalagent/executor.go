@@ -304,6 +304,8 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 					if err != nil {
 						result = fmt.Sprintf("error: %v", err)
 					} else {
+						// Merge child events into parent
+						events = append(events, wfResult.Events...)
 						result = wfResult.Output
 					}
 				} else if tc.Name == "transferToAgent" {
@@ -327,9 +329,15 @@ func (e *TemporalExecutor) buildChatModelWorkflow(config *ChatModelAgentConfig) 
 						return nil, err
 					}
 
+					// Merge child events before returning
+					events = append(events, wfResult.Events...)
 					events = append(events, &AgentEvent{Type: "completed"})
 					completed = true
-					return &wfResult, nil
+					return &WorkflowResult{
+						Output: wfResult.Output,
+						Action: wfResult.Action,
+						Events: events,
+					}, nil
 				} else {
 					// Normal tool -> Activity
 					err := workflow.ExecuteActivity(ctx, tc.Name, tc.Arguments).Get(ctx, &result)
