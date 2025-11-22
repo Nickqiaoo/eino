@@ -24,6 +24,7 @@ import (
 
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 
@@ -70,7 +71,11 @@ func NewTemporalExecutor(config *ExecutorConfig) (*TemporalExecutor, error) {
 		return nil, fmt.Errorf("failed to create temporal client: %w", err)
 	}
 
-	w := worker.New(c, taskQueue, worker.Options{})
+	w := worker.New(c, taskQueue, worker.Options{
+		Interceptors: []interceptor.WorkerInterceptor{
+			NewAgentInterceptor(),
+		},
+	})
 
 	llmTimeout := config.LLMTimeout
 	if llmTimeout == 0 {
@@ -100,6 +105,13 @@ func NewTemporalExecutor(config *ExecutorConfig) (*TemporalExecutor, error) {
 // RegisterAgentTree recursively registers an agent and all its sub-agents and tools
 func (e *TemporalExecutor) RegisterAgentTree(agent Agent) {
 	e.registerAgent(agent)
+
+	// Register callbacks if agent has them
+	if cma, ok := agent.(*ChatModelAgent); ok {
+		if config := cma.GetConfig(); config != nil && config.Callbacks != nil {
+			GetCallbackRegistry().Register(agent.Name(context.Background()), config.Callbacks)
+		}
+	}
 
 	// Register tools
 	if th, ok := agent.(ToolHolder); ok {

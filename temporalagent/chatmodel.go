@@ -32,6 +32,7 @@ type ChatModelAgentConfig struct {
 	ToolsConfig ToolsConfig
 	SubAgents   []Agent // for transfer
 	MaxIter     int
+	Callbacks   *CallbackHandler
 }
 
 // ChatModelAgent implements Agent interface
